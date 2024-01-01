@@ -3,7 +3,7 @@ package nat
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net"
 	"net/http"
 	"sync"
@@ -54,7 +54,7 @@ func InternalIPs(ctx context.Context) ([]*net.IPNet, error) {
 			switch x := addr.(type) {
 			case *net.IPNet:
 				if !x.IP.IsLoopback() {
-					Log.Printf("internal IP: %v", x)
+					Log.Info("internal interface", "addr", x)
 					out = append(out, x)
 				}
 			}
@@ -92,7 +92,7 @@ func ExternalIP(ctx context.Context) (net.IP, error) {
 		if err == nil {
 			break
 		}
-		Log.Printf("failed to get external IP: %v", err)
+		Log.Warn("failed to get external IP", err)
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
@@ -106,7 +106,7 @@ func ExternalIP(ctx context.Context) (net.IP, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("cannot get external IP: %s", resp.Status)
 	}
-	str, err := ioutil.ReadAll(resp.Body)
+	str, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("cannot read external IP: %w", err)
 	}
@@ -114,7 +114,7 @@ func ExternalIP(ctx context.Context) (net.IP, error) {
 	if ip == nil {
 		return nil, fmt.Errorf("cannot parse external IP: %q", str)
 	}
-	Log.Printf("external IP: %v", ip)
+	Log.Info("discovered external address", "addr", ip)
 	externalIP.addr = ip
 	return ip, nil
 }

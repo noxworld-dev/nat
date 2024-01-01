@@ -3,12 +3,11 @@ package nat
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
-	"os"
 )
 
-var Log = log.New(os.Stderr, "[nat]: ", log.LstdFlags|log.Lmsgprefix)
+var Log = slog.Default()
 
 // Port describes a port mapping.
 type Port struct {
@@ -23,7 +22,7 @@ func (p Port) String() string {
 
 // Map discovers NAT gateway and maps specified ports.
 func Map(ctx context.Context, ports []Port) (func(), error) {
-	Log.Println("preparing to map ports", ports)
+	Log.Info("preparing to forward", "ports", ports)
 	if len(ports) == 0 {
 		return func() {}, nil
 	}

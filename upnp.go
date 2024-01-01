@@ -2,13 +2,10 @@ package nat
 
 import (
 	"context"
-	"encoding/xml"
 	"errors"
 	"fmt"
-	"log"
 	"net"
 	"net/url"
-	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -19,7 +16,7 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-var LogUPNP = log.New(os.Stderr, "[nat-upnp]: ", log.LstdFlags|log.Lmsgprefix)
+var LogUPNP = Log
 
 type upnpClient interface {
 	GetExternalIPAddress() (string, error)
@@ -99,17 +96,8 @@ func upnpErrorCode(err error) (string, bool) {
 	if !errors.As(err, &e) {
 		return "", false
 	}
-	if e.FaultString != "UPnPError" || len(e.Detail.Raw) == 0 {
-		return "", false
-	}
-	var d struct {
-		Code string `xml:"errorCode"`
-		Desc string `xml:"errorDescription"`
-	}
-	if err := xml.Unmarshal(e.Detail.Raw, &d); err != nil {
-		return "", false
-	}
-	return d.Desc, d.Desc != ""
+	d := e.Detail.UPnPError
+	return d.ErrorDescription, d.ErrorDescription != ""
 }
 
 func (d *upnpDevice) AddPortMapping(port uint16, proto string, desc string) error {
@@ -118,31 +106,32 @@ func (d *upnpDevice) AddPortMapping(port uint16, proto string, desc string) erro
 	extIP := d.extIP.String()
 	intIP := d.ip.String()
 	attempt := 0
+	log := LogUPNP.With("internal", fmt.Sprintf("%s:%d/%s", intIP, port, proto), "external", fmt.Sprintf("%s:%d/%s", extIP, port, proto))
 	for {
-		LogUPNP.Printf("map: %s:%d/%s -> %s:%d (%v)", intIP, port, proto, extIP, port, dur)
+		log.Info("upnp map", "dur", dur)
 		err := d.cli.AddPortMapping("", port, proto, port, intIP, true, desc, uint32(dur/time.Second))
 		if err == nil {
-			LogUPNP.Printf("mapped %s:%d/%s", intIP, port, proto)
+			log.Info("mapped successfully")
 			return nil
 		}
 		code, ok := upnpErrorCode(err)
 		if !ok || code == "" {
 			attempt++
 			if attempt < 3 {
-				LogUPNP.Println("map failed, retrying:", err)
+				log.Warn("upnp map failed, retrying", "attempt", attempt, "err-type", fmt.Sprintf("%T", err), "err", err)
 				time.Sleep(time.Second / 2)
 				continue
 			}
-			LogUPNP.Println("map failed:", err)
+			log.Error("upnp map failed", "attempt", attempt, "err", err)
 			return err
 		}
-		LogUPNP.Println("map failed with code:", code)
 		switch code {
 		default:
+			log.Error("upnp map failed", "code", code, "err", err)
 			return err
 		case "OnlyPermanentLeasesSupported":
 			dur = 0 // make permanent
-			LogUPNP.Println("retrying with permanent lease")
+			log.Warn("upnp map failed, retrying with permanent lease")
 		}
 		continue
 	}
@@ -182,7 +171,7 @@ func upnpPPP1Clients(ctx context.Context) ([]upnpClientT, error) {
 
 func mapUPNP(ctx context.Context, ports []Port) (func(), error) {
 	tasks, _ := errgroup.WithContext(ctx)
-	Log.Println("discovering UPnP gateways...")
+	Log.Info("discovering UPnP gateways...")
 
 	// start those first, so the result can be cached before discovery completes
 	tasks.Go(func() error {
@@ -203,59 +192,63 @@ func mapUPNP(ctx context.Context, ports []Port) (func(), error) {
 	// then check if it reports exactly the same IP as observed by online peers,
 	// and finally check if we have a local interface in the same subnet.
 	addDiscovery := func(typ upnpType) {
+		log := LogUPNP.With("type", typ)
+		log.Info("discovering")
 		tasks.Go(func() error {
 			arr, err := typ.Clients(ctx)
 			if err != nil {
-				LogUPNP.Printf("%s: %v", typ, err)
-			} else if len(arr) != 0 {
-				LogUPNP.Printf("%s: %d device(s)", typ, len(arr))
-				inetIP, err := ExternalIP(ctx)
-				if err != nil {
-					return err
+				log.Warn("discovery failed", "type", typ, "err", err)
+				return err
+			} else if len(arr) == 0 {
+				return err
+			}
+			log.Info("found device(s)", "type", typ, "n", len(arr))
+			inetIP, err := ExternalIP(ctx)
+			if err != nil {
+				return err
+			}
+			nets, err := InternalIPs(ctx)
+			if err != nil {
+				return err
+			}
+			for _, c := range arr {
+				intIP := net.ParseIP(c.loc.Hostname())
+				if intIP == nil {
+					log.Warn("skipping device: cannot parse internal IP", "addr", c.loc.Host)
+					continue
 				}
-				nets, err := InternalIPs(ctx)
+				addr, err := c.GetExternalIPAddress()
 				if err != nil {
-					return err
+					log.Warn("skipping device: cannot get external address", "internal", intIP, "err", err)
+					continue
 				}
-				for _, c := range arr {
-					intIP := net.ParseIP(c.loc.Hostname())
-					if intIP == nil {
-						LogUPNP.Printf("%s: skipping device (%s): cannot parse internal IP", typ, c.loc.Host)
-						continue
+				extIP := net.ParseIP(addr)
+				if extIP == nil {
+					log.Warn("skipping device: cannot parse external IP", "internal", intIP, "external", addr)
+					continue
+				}
+				if !inetIP.Equal(extIP) {
+					log.Warn("skipping device: doesn't offer our external IP", "internal", intIP, "external", extIP)
+					continue
+				}
+				var ip net.IP
+				for _, n := range nets {
+					if n.Contains(intIP) {
+						ip = n.IP
+						break
 					}
-					addr, err := c.GetExternalIPAddress()
-					if err != nil {
-						LogUPNP.Printf("%s: skipping device (%s): cannot get external address: %v", typ, intIP, err)
-						continue
-					}
-					extIP := net.ParseIP(addr)
-					if extIP == nil {
-						LogUPNP.Printf("%s: skipping device (%s -> %s): cannot parse IP", typ, intIP, addr)
-						continue
-					}
-					if !inetIP.Equal(extIP) {
-						LogUPNP.Printf("%s: skipping device (%s -> %s): doesn't offer our external IP", typ, intIP, extIP)
-						continue
-					}
-					var ip net.IP
-					for _, n := range nets {
-						if n.Contains(intIP) {
-							ip = n.IP
-							break
-						}
-					}
-					if ip == nil {
-						LogUPNP.Printf("%s: skipping device (%s -> %s): cannot find relevant local interface", typ, intIP, addr)
-						continue
-					}
+				}
+				if ip == nil {
+					log.Warn("skipping device: cannot find relevant local interface", "internal", intIP, "external", extIP)
+					continue
+				}
 
-					gmu.Lock()
-					gateways = append(gateways, &upnpDevice{
-						typ: typ, cli: c,
-						ip: ip, extIP: extIP, intIP: intIP,
-					})
-					gmu.Unlock()
-				}
+				gmu.Lock()
+				gateways = append(gateways, &upnpDevice{
+					typ: typ, cli: c,
+					ip: ip, extIP: extIP, intIP: intIP,
+				})
+				gmu.Unlock()
 			}
 			return err
 		})
@@ -267,11 +260,11 @@ func mapUPNP(ctx context.Context, ports []Port) (func(), error) {
 	addDiscovery(upnpIG2PPP1)
 
 	if err := tasks.Wait(); err != nil {
-		Log.Println("cannot discover gateways:", err)
+		Log.Warn("cannot discover gateways", "err", err)
 		return nil, err
 	}
 	if len(gateways) == 0 {
-		Log.Println("no NAT gateways detected")
+		Log.Info("no NAT gateways detected")
 		return func() {}, nil
 	}
 	sort.Slice(gateways, func(i, j int) bool {
@@ -293,12 +286,13 @@ func mapUPNP(ctx context.Context, ports []Port) (func(), error) {
 	var last error
 gwloop:
 	for _, g := range gateways {
-		Log.Println("trying to map via", g.Name())
+		Log.Info("trying to map via host", "name", g.Name())
 		for _, p := range ports {
-			Log.Printf("mapping %d/%s -> %s:%d", p.Port, p.Proto, g.ExternalIP(), p.Port)
+			log := Log.With("internal", fmt.Sprintf("%d/%s", p.Port, p.Proto), "external", fmt.Sprintf("%s:%d/%s", g.ExternalIP(), p.Port, p.Proto))
+			log.Info("mapping")
 			err := g.AddPortMapping(uint16(p.Port), p.Proto, p.Desc)
 			if err != nil {
-				Log.Printf("mapping %d/%s failed: %v", p.Port, p.Proto, err)
+				log.Warn("mapping failed", "err", err)
 				stop()
 				last = err
 				continue gwloop
@@ -307,10 +301,10 @@ gwloop:
 		}
 	}
 	if len(mapped) != len(ports) {
-		Log.Println("port mapping failed")
+		Log.Error("port mapping failed")
 		stop()
 		return nil, last
 	}
-	Log.Println("port mapping successful")
+	Log.Info("port mapping successful")
 	return stop, nil
 }
